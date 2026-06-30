@@ -189,6 +189,123 @@ function addToPipeline(url, company, role) {
   return 'added';
 }
 
+// ─── Job scoring ─────────────────────────────────────────────────────────────
+
+// AI-first companies get a bonus — they're higher-signal matches
+const AI_FIRST_COS = new Set([
+  'anthropic','openai','deepmind','google deepmind','mistral','cohere','ai21','hugging face',
+  'huggingface','inflection','character.ai','adept','stability ai','scale ai','runway',
+  'perplexity','together ai','modal','replicate','weights & biases','wandb',
+]);
+
+function loadScoringProfile(rootDir) {
+  const profile = { skills: new Set(), targetRoles: [], targetLevel: 'mid', targetLocation: '' };
+
+  // Parse cv.md for skills
+  const cvPath = path.join(rootDir, 'cv.md');
+  if (fs.existsSync(cvPath)) {
+    const cvText = fs.readFileSync(cvPath, 'utf8');
+    TECH_RE.lastIndex = 0;
+    let m;
+    while ((m = TECH_RE.exec(cvText)) !== null) profile.skills.add(m[0].toLowerCase().trim());
+  }
+
+  // Parse config/profile.yml (simple regex — no yaml dep needed)
+  const profPath = path.join(rootDir, 'config', 'profile.yml');
+  if (fs.existsSync(profPath)) {
+    const text = fs.readFileSync(profPath, 'utf8');
+    const primaryBlock = text.match(/primary:\s*\n((?:\s+-\s+.+\n?)*)/);
+    if (primaryBlock) {
+      for (const line of primaryBlock[1].split('\n')) {
+        const r = line.match(/^\s+-\s+"?(.+?)"?\s*$/);
+        if (r) profile.targetRoles.push(r[1].toLowerCase());
+      }
+    }
+    const locMatch = text.match(/location:\s*"?([^"\n,]+)/);
+    if (locMatch) profile.targetLocation = locMatch[1].toLowerCase().trim();
+  }
+  return profile;
+}
+
+function scoreJob(job, profile) {
+  const t   = (job.title    || '').toLowerCase();
+  const loc = (job.location || '').toLowerCase();
+  const co  = (job.company  || '').toLowerCase();
+  let score = 0;
+
+  // ── 1. Role centrality (0-40) ────────────────────────────────────────────
+  if (profile.targetRoles.length) {
+    // Score against user's explicitly configured target roles
+    let best = 0;
+    for (const role of profile.targetRoles) {
+      const words = role.split(/\s+/).filter(w => w.length > 2);
+      const matched = words.filter(w => t.includes(w)).length;
+      best = Math.max(best, (matched / words.length) * 40);
+    }
+    score += best;
+  } else {
+    // Default: rank by how central AI/data engineering is to the role itself
+    if (/\b(ai|ml|machine learning|deep learning)\s+(engineer|researcher|scientist)\b/.test(t))     score += 40;
+    else if (/\b(applied scientist|research scientist|research engineer)\b/.test(t))                  score += 38;
+    else if (/\b(data scientist|analytics engineer|data analytics engineer)\b/.test(t))              score += 36;
+    else if (/\b(data engineer|ml engineer|mlops engineer)\b/.test(t))                               score += 34;
+    else if (/\b(data analyst|business intelligence|bi engineer|bi analyst)\b/.test(t))              score += 30;
+    else if (/\b(llm|genai|generative ai|llmops|ai product|ai platform|ai infra)\b/.test(t))        score += 32;
+    else if (/\b(forward deployed|solutions engineer|solutions architect)\b/.test(t))                score += 22;
+    else if (/\b(product manager|technical program)\b/.test(t))                                      score += 14;
+    else if (/\b(sales|marketing|gtm|account|customer success|recruiter)\b/.test(t))                score +=  6;
+    else if (/\b(ai|ml|data|llm|agent|genai)\b/.test(t))                                            score += 20; // AI-adjacent
+    else                                                                                              score += 10;
+  }
+
+  // ── 2. Seniority fit (0-25) — mid-level sweet spot ──────────────────────
+  if (/\b(intern|co-?op|internship)\b/.test(t))                                                      score +=  0;
+  else if (/\b(director|vp|vice president|head of|chief)\b/.test(t))                                score +=  6;
+  else if (/\b(staff|principal|distinguished)\b/.test(t))                                            score += 12;
+  else if (/\b(senior|sr\.?|lead|ii|iii)\b/.test(t))                                                score += 25;
+  else if (/\b(junior|jr\.?|associate|entry|new grad|university grad|i\b)\b/.test(t))               score += 16;
+  else                                                                                                score += 22; // no qualifier → assume mid
+
+  // ── 3. Location (0-20) ──────────────────────────────────────────────────
+  const userLoc = profile.targetLocation;
+  if (/remote|anywhere|worldwide|fully remote/.test(loc))                                             score += 20;
+  else if (/hybrid/.test(loc))                                                                        score += 14;
+  else if (userLoc && loc.includes(userLoc))                                                          score += 18;
+  else if (/united states|usa|us\b/.test(loc))                                                        score += 10;
+  else if (/new york|nyc|san francisco|sf\b|boston|seattle|austin|chicago/.test(loc))                score +=  8;
+  else if (loc)                                                                                        score +=  3;
+
+  // ── 4. Company signal (0-15) ─────────────────────────────────────────────
+  if (AI_FIRST_COS.has(co))                                                                           score += 15;
+  else if (co)                                                                                         score +=  5;
+
+  // ── 5. Skills overlap from CV (0-10, only when cv.md exists) ────────────
+  if (profile.skills.size > 0) {
+    let hits = 0;
+    for (const sk of profile.skills) { if (t.includes(sk)) hits++; }
+    score += Math.min(10, hits * 4);
+  }
+
+  // Hard penalty for intern/co-op
+  if (/\b(intern|co-?op|internship)\b/.test(t)) score = Math.min(score, 18);
+
+  return Math.min(100, Math.round(score));
+}
+
+function syncTopToPipeline(n, rootDir) {
+  const jobs = parseScanHistory(rootDir);
+  if (!jobs.length) return { synced: 0, error: 'No scan history found. Run a scan first.' };
+  const profile = loadScoringProfile(rootDir);
+  const top = jobs
+    .map(j => ({ ...j, score: scoreJob(j, profile) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, n);
+  const entries = top.map(j => `- [ ] ${j.url} | ${j.company || ''} | ${j.title || ''}`).join('\n');
+  const content = `# Pipeline — Pending URLs\n\nTop ${top.length} jobs by match score. Run \`/career-ops pipeline\` to evaluate.\n\n## Pending\n\n${entries}\n\n## Processed\n`;
+  fs.writeFileSync(path.join(rootDir, 'data', 'pipeline.md'), content, 'utf8');
+  return { synced: top.length, topScore: top[0]?.score ?? 0, cutoffScore: top[top.length - 1]?.score ?? 0 };
+}
+
 // ─── portals.yml bootstrap ───────────────────────────────────────────────────
 
 function ensurePortals() {
@@ -210,10 +327,10 @@ function buildPage() {
   const apps = parseApplications(ROOT);
   const ts = new Date().toLocaleString();
 
-  const enriched = scanJobs.map(j => ({
-    ...j,
-    inPipeline: pipelineUrls.has(j.url),
-  }));
+  const scoringProfile = loadScoringProfile(ROOT);
+  const enriched = scanJobs
+    .map(j => ({ ...j, inPipeline: pipelineUrls.has(j.url), score: scoreJob(j, scoringProfile) }))
+    .sort((a, b) => b.score - a.score);
 
   const dataJson = JSON.stringify({ scanJobs: enriched, pipeline, apps, generated: new Date().toISOString() });
 
@@ -343,6 +460,13 @@ tr:last-child td{border-bottom:none}
 .kw-panel-note{font-family:var(--mono);font-size:10px;color:var(--subtle);margin-top:10px;padding-top:8px;border-top:1px solid var(--border)}
 .kw-panel-error{color:var(--red);font-family:var(--mono);font-size:11px}
 
+/* Score badge */
+.score-badge{font-family:var(--mono);font-size:11px;font-weight:700;padding:2px 7px;border-radius:2px;flex-shrink:0;min-width:36px;text-align:center}
+.score-hi{color:var(--green);border:1px solid var(--green);background:var(--green-bg)}
+.score-ok{color:var(--blue);border:1px solid var(--blue);background:var(--blue-bg)}
+.score-mid{color:var(--amber);border:1px solid var(--amber);background:var(--amber-bg)}
+.score-lo{color:var(--red);border:1px solid var(--red);background:var(--red-bg)}
+
 /* Scan controls */
 .scan-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:8px}
 .scan-title{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--subtle)}
@@ -403,8 +527,14 @@ tr:last-child td{border-bottom:none}
   <!-- ── Search tab ── -->
   <div id="search" class="tab-content active">
     <div class="scan-header">
-      <span class="scan-title" id="scan-count-label">job board results</span>
-      <button class="action-btn btn-blue" onclick="runScan()" id="scan-btn" style="font-size:11px;padding:5px 14px">↺ run new scan</button>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span class="scan-title" id="scan-count-label">job board results</span>
+        <span id="score-note" style="font-family:var(--mono);font-size:10px;color:var(--subtle)"></span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="action-btn btn-pipeline" onclick="syncTopPipeline()" id="sync-btn" style="font-size:11px;padding:5px 14px" title="Replace pipeline.md with the top 100 scored jobs">⇅ sync top 100 → pipeline</button>
+        <button class="action-btn btn-blue" onclick="runScan()" id="scan-btn" style="font-size:11px;padding:5px 14px">↺ run new scan</button>
+      </div>
     </div>
     <div class="toolbar">
       <input class="search-input" id="job-search" placeholder="filter by title, company, location…" oninput="filterJobs()">
@@ -580,12 +710,22 @@ function applyJobFilters() {
   renderJobList();
 }
 
+function scoreClass(s){return s>=70?'score-hi':s>=50?'score-ok':s>=35?'score-mid':'score-lo'}
+
 function renderJobList() {
   const el = document.getElementById('job-list');
   const badge = document.getElementById('job-count-badge');
   const label = document.getElementById('scan-count-label');
-  badge.textContent = \`\${visibleJobs.length} job\${visibleJobs.length!==1?'s':''}\`;
-  label.textContent = \`job board results (\${allJobs.length} total)\`;
+  const scoreNote = document.getElementById('score-note');
+  badge.textContent = visibleJobs.length+' job'+(visibleJobs.length!==1?'s':'');
+  label.textContent = 'job board results ('+allJobs.length+' total, sorted by match score)';
+
+  // Show score distribution hint
+  if (allJobs.length > 0) {
+    const avg = Math.round(allJobs.reduce((s,j)=>s+(j.score||0),0)/allJobs.length);
+    const top = allJobs.filter(j=>(j.score||0)>=70).length;
+    scoreNote.textContent = 'avg '+avg+' · '+top+' strong matches (≥70)';
+  }
 
   if (!visibleJobs.length) {
     el.innerHTML = allJobs.length === 0
@@ -595,6 +735,8 @@ function renderJobList() {
   }
 
   el.innerHTML = visibleJobs.map(({origIdx:idx, job:j}) => {
+    const sc = j.score ?? 0;
+    const scorePill = \`<span class="score-badge \${scoreClass(sc)}">\${sc}</span>\`;
     const ats = j.ats ? \`<span class="ats-tag">\${esc(j.ats)}</span>\` : '';
     const date = relTime(j.firstSeen);
     const loc = j.location ? \`<span style="font-family:var(--mono);font-size:10px;color:var(--subtle)">\${esc(j.location)}</span>\` : '';
@@ -611,6 +753,7 @@ function renderJobList() {
             <div class="job-company">\${esc(j.company||'Unknown')}\${loc?'  ·  ':''}\${loc}</div>
           </div>
           <div class="job-meta">
+            \${scorePill}
             \${ats}
             \${date?\`<span class="job-date">\${esc(date)}</span>\`:''}
           </div>
@@ -749,6 +892,24 @@ async function addSelectedToPipeline() {
   toast('Added '+added+' job'+(added!==1?'s':'')+' to pipeline'+(dupes>0?' ('+dupes+' already there)':''));
   clearSelection();
   applyJobFilters(); // refresh buttons
+}
+
+// ─── Sync top N → pipeline ────────────────────────────────────────────────────
+async function syncTopPipeline() {
+  if (!allJobs.length) { toast('No scan history — run a scan first','warn'); return; }
+  const btn = document.getElementById('sync-btn');
+  btn.textContent='syncing…'; btn.disabled=true;
+  try {
+    const r = await fetch('/api/pipeline/sync-top',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({n:100})});
+    const d = await r.json();
+    btn.textContent='⇅ sync top 100 → pipeline'; btn.disabled=false;
+    if (d.error) { toast(d.error,'err'); return; }
+    toast('Pipeline replaced: top '+d.synced+' jobs (scores '+d.topScore+'→'+d.cutoffScore+')');
+    // Mark all jobs as inPipeline if in top 100
+    const top100Urls = new Set(allJobs.slice(0,100).map(j=>j.url));
+    allJobs.forEach(j=>{ j.inPipeline = top100Urls.has(j.url); });
+    applyJobFilters();
+  } catch(e) { btn.textContent='⇅ sync top 100 → pipeline'; btn.disabled=false; toast('Sync failed','err'); }
 }
 
 // ─── Scan ────────────────────────────────────────────────────────────────────
@@ -897,6 +1058,14 @@ const server = http.createServer(async (req, res) => {
       byUrl[r.url] = r.keywords;
     }
     return json(res, { byUrl, errors });
+  }
+
+  // ── POST /api/pipeline/sync-top ──
+  if (method === 'POST' && url === '/api/pipeline/sync-top') {
+    const body = await readBody(req);
+    const n = Math.min(Math.max(1, parseInt(body.n || '100', 10)), 500);
+    const result = syncTopToPipeline(n, ROOT);
+    return json(res, result.error ? { error: result.error } : result, result.error ? 400 : 200);
   }
 
   // ── POST /api/scan/run ──
