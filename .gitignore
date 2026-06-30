@@ -54,6 +54,9 @@ reports/*-RESERVED.md
 # Backup files written by normalize-statuses.mjs / dedup-tracker.mjs
 *.bak
 
+# Generated dashboard (run node generate-dashboard.mjs to rebuild)
+dashboard.html
+
 # OS
 .DS_Store
 *.mov
