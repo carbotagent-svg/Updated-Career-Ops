@@ -223,6 +223,8 @@ function loadScoringProfile(rootDir) {
     }
     const locMatch = text.match(/location:\s*"?([^"\n,]+)/);
     if (locMatch) profile.targetLocation = locMatch[1].toLowerCase().trim();
+    const levelMatch = text.match(/target_level:\s*"?([^"\n]+)"?/);
+    if (levelMatch) profile.targetLevel = levelMatch[1].toLowerCase().trim();
   }
   return profile;
 }
@@ -258,12 +260,13 @@ function scoreJob(job, profile) {
     else                                                                                              score += 10;
   }
 
-  // ── 2. Seniority fit (0-25) — mid-level sweet spot ──────────────────────
+  // ── 2. Seniority fit (0-25) — calibrated to target_level ────────────────
+  const isEntryMid = profile.targetLevel.includes('entry');
   if (/\b(intern|co-?op|internship)\b/.test(t))                                                      score +=  0;
-  else if (/\b(director|vp|vice president|head of|chief)\b/.test(t))                                score +=  6;
-  else if (/\b(staff|principal|distinguished)\b/.test(t))                                            score += 12;
-  else if (/\b(senior|sr\.?|lead|ii|iii)\b/.test(t))                                                score += 25;
-  else if (/\b(junior|jr\.?|associate|entry|new grad|university grad|i\b)\b/.test(t))               score += 16;
+  else if (/\b(director|vp|vice president|head of|chief)\b/.test(t))                                score +=  4;
+  else if (/\b(staff|principal|distinguished)\b/.test(t))                                            score += isEntryMid ?  8 : 14;
+  else if (/\b(senior|sr\.?|lead|ii|iii)\b/.test(t))                                                score += isEntryMid ? 18 : 25;
+  else if (/\b(junior|jr\.?|associate|entry|new grad|university grad)\b/.test(t))                   score += isEntryMid ? 25 : 14;
   else                                                                                                score += 22; // no qualifier → assume mid
 
   // ── 3. Location (0-20) ──────────────────────────────────────────────────
